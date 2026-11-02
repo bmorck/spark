@@ -27,12 +27,13 @@ import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.util.AttributeNameParser
 import org.apache.spark.sql.catalyst.util.QuotingUtils.quoteNameParts
 import org.apache.spark.sql.connector.{StrLen, StrLenDefault, StrLenMagic}
-import org.apache.spark.sql.connector.catalog.{Identifier, InMemoryCatalog, Table, TableCatalog, TableChange}
+import org.apache.spark.sql.connector.catalog.{Identifier, InMemoryCatalog, InMemoryRelationCatalog, Table, TableCatalog, TableChange}
 import org.apache.spark.sql.connector.catalog.constraints.{Check, Constraint}
 import org.apache.spark.sql.connector.catalog.functions.{ScalarFunction, UnboundFunction}
 import org.apache.spark.sql.execution.command.DDLCommandTestUtils
 import org.apache.spark.sql.functions.udaf
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.metricview.serde.{AssetSource, Column, DimensionExpression, MeasureExpression, MetricView, MetricViewFactory}
 import org.apache.spark.sql.types.{DataType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -185,6 +186,98 @@ class CheckConstraintSuite extends QueryTest with CommandSuiteBase with DDLComma
         checkSubqueryError(s"REPLACE TABLE $t $schema", c)
         assert(loadTable(nonPartitionCatalog, "ns", "tbl").constraints.isEmpty)
       }
+    }
+  }
+
+  // UNIQUE resolves its target as a table, so a CHECK constraint must fail the same way.
+  private def checkAddConstraintOnView(view: String, viewName: String): Unit = {
+    Seq("CHECK (id > 10)", "UNIQUE (id)").foreach { constraint =>
+      val query = s"ALTER TABLE $view ADD CONSTRAINT c1 $constraint"
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(query)
+        },
+        condition = "EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE",
+        sqlState = "42809",
+        parameters = Map(
+          "operation" -> "ALTER TABLE ... ADD CONSTRAINT",
+          "viewName" -> viewName),
+        context = ExpectedContext(fragment = query))
+    }
+  }
+
+  test("SPARK-60454: Check constraint added to a view of a V2 table") {
+    withNamespaceAndTable("ns", "tbl", nonPartitionCatalog) { t =>
+      sql(s"CREATE TABLE $t (id INT) $defaultUsing")
+      // The row violates the constraint, but validating through the view would not read it.
+      sql(s"INSERT INTO $t VALUES (5)")
+      val query = s"SELECT * FROM $t WHERE id > 50"
+
+      withTempView("v") {
+        sql(s"CREATE TEMPORARY VIEW v AS $query")
+        checkAddConstraintOnView("v", "`v`")
+      }
+      withTempView("v") {
+        sql(query).createTempView("v")
+        checkAddConstraintOnView("v", "`v`")
+      }
+      withGlobalTempView("v") {
+        sql(s"CREATE GLOBAL TEMPORARY VIEW v AS $query")
+        checkAddConstraintOnView("global_temp.v", "`global_temp`.`v`")
+      }
+      withView("v") {
+        sql(s"CREATE VIEW v AS $query")
+        checkAddConstraintOnView("v", "`spark_catalog`.`default`.`v`")
+      }
+      val viewCatalog = "check_constraint_view_catalog"
+      withSQLConf(s"spark.sql.catalog.$viewCatalog" -> classOf[InMemoryRelationCatalog].getName) {
+        val view = s"$viewCatalog.ns1.ns2.v"
+        sql(s"CREATE NAMESPACE $viewCatalog.ns1")
+        sql(s"CREATE NAMESPACE $viewCatalog.ns1.ns2")
+        withView(view) {
+          sql(s"CREATE VIEW $view AS $query")
+          checkAddConstraintOnView(view, s"`$viewCatalog`.`ns1`.`ns2`.`v`")
+        }
+      }
+
+      assert(loadTable(nonPartitionCatalog, "ns", "tbl").constraints.isEmpty)
+    }
+  }
+
+  test("SPARK-60454: Check constraint added to a view of a V1 table") {
+    withTable("t") {
+      sql("CREATE TABLE t (id INT) USING parquet")
+      withTempView("v") {
+        sql("CREATE TEMPORARY VIEW v AS SELECT * FROM t")
+        checkAddConstraintOnView("v", "`v`")
+      }
+    }
+  }
+
+  test("SPARK-60454: Check constraint added to a metric view") {
+    withNamespaceAndTable("ns", "tbl", nonPartitionCatalog) { t =>
+      sql(s"CREATE TABLE $t (id INT) $defaultUsing")
+      val metricView = MetricView(
+        "0.1",
+        AssetSource(t),
+        None,
+        Seq(
+          Column("id", DimensionExpression("id"), 0),
+          Column("id_sum", MeasureExpression("sum(id)"), 1)))
+      withView("mv") {
+        sql(
+          s"""
+             |CREATE VIEW mv
+             |WITH METRICS
+             |LANGUAGE YAML
+             |AS
+             |$$$$
+             |${MetricViewFactory.toYAML(metricView)}
+             |$$$$
+             |""".stripMargin)
+        checkAddConstraintOnView("mv", "`spark_catalog`.`default`.`mv`")
+      }
+      assert(loadTable(nonPartitionCatalog, "ns", "tbl").constraints.isEmpty)
     }
   }
 

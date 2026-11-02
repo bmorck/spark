@@ -63,6 +63,7 @@ import org.apache.spark.sql.execution.datasources.v2.{ChangelogTable, DataSource
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy}
 import org.apache.spark.sql.internal.connector.{SchemaAlignmentConfig, SupportsConfigurableSchemaAlignment, V1Function}
+import org.apache.spark.sql.metricview.logical.MetricViewPlaceholder
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.ArrayImplicits._
@@ -1327,6 +1328,20 @@ class Analyzer(
             }.getOrElse(write)
           case _ => write
         }
+
+      // The command reads its target as a relation to validate the existing rows. Through a view,
+      // it would validate the rows of the view and add the constraint to the base table.
+      case a @ AddCheckConstraint(Filter(_, relation), _) =>
+        val view = EliminateSubqueryAliases(relation) match {
+          case v: View => Some(v.desc)
+          case m: MetricViewPlaceholder => Some(m.metadata)
+          case _ => None
+        }
+        view.foreach { desc =>
+          throw QueryCompilationErrors.expectTableNotViewError(
+            desc.fullIdent, "ALTER TABLE ... ADD CONSTRAINT", suggestAlternative = false, a)
+        }
+        a
 
       case u: UnresolvedRelation =>
         resolveRelation(u).map(resolveViews(_, u.options)).getOrElse(u)
